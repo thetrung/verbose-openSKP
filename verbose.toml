@@ -1,0 +1,11 @@
+[package]
+name = "verbose-openSKP"
+version = "0.1.0"
+description = "VerBose-Lang C ABI wrapper around OpenSKP for loading SketchUp (.skp) instanced scenes, meshes, materials, crease edges, layers, and camera pages"
+license = "MIT"
+repository = "https://github.com/thetrung/verbose-openSKP"
+
+[lib]
+include_dir = "src"
+entry = "openskp.vb"
+c_libs = ["verbose_openskp", "stdc++", "m"]
