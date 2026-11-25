@@ -1080,7 +1080,9 @@ struct Archive {
       v->xf = r.f64s(12);
       r.f64();    // constant 1.0
       r.utf16();  // source path
-      v->guid = guid_from_windows_bytes(r.raw(16));
+      if (legacy_instance_has_guid(ver)) {
+        v->guid = guid_from_windows_bytes(r.raw(16));
+      }
     } else if (n == "CRelationship") {
       // two object pointers (small maps: two u16 back-refs - which read
       // like the "u32" of the public notes; big maps escalate them to
