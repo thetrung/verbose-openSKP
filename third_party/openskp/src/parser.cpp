@@ -73,6 +73,7 @@ Scene build_scene(ByteBuffer b, const ParseOptions& o) {
 
 InstancedScene build_instanced_scene(ByteBuffer b, const ParseOptions& o) {
   auto raw = full_parse(b, o);
+  ByteBuffer().swap(b);
   unpainted_style_colors(raw, o.unpainted_faces);
   try {
     return build_instanced_scene_raw(std::move(raw), o);

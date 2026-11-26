@@ -19,8 +19,24 @@ namespace {
 // internal index they'd otherwise fall back to - mirrors Python's
 // _is_generic_definition_name() exactly (same pattern, same purpose).
 bool is_generic_definition_name(const std::string& name) {
-  static const std::regex kPattern(R"(^(?:Group|Component)\d*#\d+$)");
-  return std::regex_match(name, kPattern);
+  // Exact match for ^(?:Group|Component)\d*#\d+$ without std::regex overhead per instance.
+  size_t pos = 0;
+  if (name.rfind("Group", 0) == 0) {
+    pos = 5;
+  } else if (name.rfind("Component", 0) == 0) {
+    pos = 9;
+  } else {
+    return false;
+  }
+  while (pos < name.size() && name[pos] >= '0' && name[pos] <= '9') ++pos;
+  if (pos >= name.size() || name[pos] != '#') return false;
+  ++pos;
+  if (pos >= name.size()) return false;
+  while (pos < name.size()) {
+    if (name[pos] < '0' || name[pos] > '9') return false;
+    ++pos;
+  }
+  return true;
 }
 
 // Same exclusions as scene.cpp / scene.py: dynamic_attributes is already

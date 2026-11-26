@@ -5,12 +5,17 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include <openskp/create.hpp>
 #include <openskp/parser.hpp>
@@ -35,7 +40,7 @@ struct FlattenedMesh {
 };
 
 struct FlattenedInstance {
-  std::string name;
+  uint32_t nameIdx = 0;
   int32_t meshIndex = 0;
   int32_t materialIndex = 0;
   int32_t layerIndex = 0;
@@ -63,13 +68,16 @@ struct FlattenedPage {
 };
 
 struct VskpScene {
-  openskp::InstancedScene raw;
+  std::vector<openskp::GltfMaterial> materials;
+  std::vector<openskp::SceneTexture> textures;
   VskpBounds bounds{};
   std::vector<FlattenedMesh> meshes;
   std::vector<FlattenedInstance> instances;
   std::vector<FlattenedLayer> layers;
   std::vector<FlattenedPage> pages;
+  std::vector<std::string> namePool;
   std::unordered_map<std::string, int32_t> layerMap;
+  std::unordered_map<std::string, uint32_t> nameIndex;
 };
 
 /* Column-major 4x4 matrix multiply: out = A * B */
@@ -195,23 +203,57 @@ void extract_crease_edges(FlattenedMesh& mesh) {
       mesh.creasePositions.push_back(adj.bz);
     }
   }
+  mesh.creasePositions.shrink_to_fit();
 }
 
-int32_t get_or_add_layer(VskpScene& sc, const std::string& name) {
+int32_t get_or_add_layer(VskpScene& sc,
+                         const std::map<std::string, bool>& layerHiddenMap,
+                         const std::string& name) {
   std::string key = name.empty() ? "Layer0" : name;
   auto it = sc.layerMap.find(key);
   if (it != sc.layerMap.end()) return it->second;
   int32_t idx = static_cast<int32_t>(sc.layers.size());
   FlattenedLayer layer;
   layer.name = key;
-  auto hid = sc.raw.layer_hidden.find(key);
-  layer.hidden = (hid != sc.raw.layer_hidden.end() && hid->second) ? 1 : 0;
+  auto hid = layerHiddenMap.find(key);
+  layer.hidden = (hid != layerHiddenMap.end() && hid->second) ? 1 : 0;
   sc.layers.push_back(std::move(layer));
-  sc.layerMap.emplace(key, idx);
+  sc.layerMap.emplace(std::move(key), idx);
   return idx;
 }
 
+uint32_t intern_name(VskpScene& sc, const std::string& name) {
+  auto it = sc.nameIndex.find(name);
+  if (it != sc.nameIndex.end()) return it->second;
+  uint32_t idx = static_cast<uint32_t>(sc.namePool.size());
+  sc.namePool.push_back(name);
+  sc.nameIndex.emplace(name, idx);
+  return idx;
+}
+
+size_t count_hierarchy_instances(
+    const openskp::InstancedNode& node,
+    const std::unordered_map<std::string, std::pair<int32_t, int32_t>>& resRanges,
+    const std::vector<FlattenedMesh>& meshes) {
+  size_t total = 0;
+  if (node.mesh_resource_id.has_value()) {
+    auto it = resRanges.find(*node.mesh_resource_id);
+    if (it != resRanges.end()) {
+      int32_t startIdx = it->second.first;
+      int32_t count = it->second.second;
+      for (int32_t m = 0; m < count; ++m) {
+        if (!meshes[startIdx + m].indices.empty()) total += 1;
+      }
+    }
+  }
+  for (const auto& child : node.children) {
+    total += count_hierarchy_instances(child, resRanges, meshes);
+  }
+  return total;
+}
+
 void walk_hierarchy(VskpScene& sc,
+                    const std::map<std::string, bool>& layerHiddenMap,
                     const openskp::InstancedNode& node,
                     const double parentWorld[16],
                     const std::unordered_map<std::string, std::pair<int32_t, int32_t>>& resRanges,
@@ -219,7 +261,7 @@ void walk_hierarchy(VskpScene& sc,
   double world[16];
   mat4_mul(parentWorld, node.matrix.data(), world);
 
-  int32_t layerIdx = get_or_add_layer(sc, node.layer);
+  int32_t layerIdx = get_or_add_layer(sc, layerHiddenMap, node.layer);
   int32_t layerHidden = sc.layers[layerIdx].hidden;
 
   if (node.mesh_resource_id.has_value()) {
@@ -228,22 +270,26 @@ void walk_hierarchy(VskpScene& sc,
       int32_t startIdx = it->second.first;
       int32_t count = it->second.second;
       int32_t objId = nextObjectId++;
+      const std::string& rawName = !node.name.empty() ? node.name : node.definition_name;
+      uint32_t nameIdx = rawName.empty() ? intern_name(sc, "Mesh_" + std::to_string(objId))
+                                         : intern_name(sc, rawName);
+      float wmat[16];
+      for (int k = 0; k < 16; ++k) {
+        wmat[k] = static_cast<float>(world[k]);
+      }
       for (int32_t m = 0; m < count; ++m) {
         int32_t meshIdx = startIdx + m;
         const FlattenedMesh& fm = sc.meshes[meshIdx];
         if (fm.indices.empty()) continue;
 
         FlattenedInstance inst;
-        inst.name = node.name.empty() ? node.definition_name : node.name;
-        if (inst.name.empty()) inst.name = "Mesh_" + std::to_string(objId);
+        inst.nameIdx = nameIdx;
         inst.meshIndex = meshIdx;
         inst.materialIndex = fm.materialIndex;
         inst.layerIndex = layerIdx;
         inst.objectId = objId;
         inst.hidden = layerHidden;
-        for (int k = 0; k < 16; ++k) {
-          inst.worldMat[k] = static_cast<float>(world[k]);
-        }
+        std::memcpy(inst.worldMat, wmat, sizeof(wmat));
 
         /* Transform all 8 corners of the local AABB to get exact world AABB. */
         float wminX = std::numeric_limits<float>::infinity();
@@ -268,41 +314,48 @@ void walk_hierarchy(VskpScene& sc,
         }
         inst.worldMinX = wminX; inst.worldMinY = wminY; inst.worldMinZ = wminZ;
         inst.worldMaxX = wmaxX; inst.worldMaxY = wmaxY; inst.worldMaxZ = wmaxZ;
-        sc.instances.push_back(std::move(inst));
+        sc.instances.push_back(inst);
       }
     }
   }
 
   for (const auto& child : node.children) {
-    walk_hierarchy(sc, child, world, resRanges, nextObjectId);
+    walk_hierarchy(sc, layerHiddenMap, child, world, resRanges, nextObjectId);
   }
 }
 
 void* finalize_scene(openskp::InstancedScene&& rawScene) {
   auto sc = std::make_unique<VskpScene>();
-  sc->raw = std::move(rawScene);
+  sc->materials = std::move(rawScene.gltf_materials);
+  sc->textures = std::move(rawScene.textures);
+
+  /* Release unused curve resources early before flattening */
+  std::vector<openskp::InstancedCurveResource>().swap(rawScene.curve_resources);
 
   /* Register all known layers first */
-  get_or_add_layer(*sc, "Layer0");
-  for (const auto& kv : sc->raw.layer_hidden) {
-    get_or_add_layer(*sc, kv.first);
+  get_or_add_layer(*sc, rawScene.layer_hidden, "Layer0");
+  for (const auto& kv : rawScene.layer_hidden) {
+    get_or_add_layer(*sc, rawScene.layer_hidden, kv.first);
   }
 
-  /* Flatten unique mesh resources into per-primitive RAM meshes + crease edges */
+  /* Flatten unique mesh resources into per-primitive RAM meshes + crease edges (move buffers, zero duplicate!) */
   std::unordered_map<std::string, std::pair<int32_t, int32_t>> resRanges;
-  for (const auto& res : sc->raw.mesh_resources) {
+  resRanges.reserve(rawScene.mesh_resources.size());
+  for (auto& res : rawScene.mesh_resources) {
     int32_t startIdx = static_cast<int32_t>(sc->meshes.size());
     int32_t cnt = 0;
-    for (const auto& prim : res.primitives) {
+    for (auto& prim : res.primitives) {
       if (prim.positions.empty() || prim.indices.empty()) continue;
       FlattenedMesh fm;
-      fm.positions = prim.positions;
-      fm.normals = prim.normals;
-      fm.uvs = prim.uvs;
+      fm.positions = std::move(prim.positions);
+      fm.normals = std::move(prim.normals);
+      fm.uvs = std::move(prim.uvs);
       fm.indices.resize(prim.indices.size());
       for (size_t i = 0; i < prim.indices.size(); ++i) {
         fm.indices[i] = static_cast<int32_t>(prim.indices[i]);
       }
+      std::vector<std::uint32_t>().swap(prim.indices);
+      std::vector<std::uint32_t>().swap(prim.back_triangles);
       /* Ensure normals match vertex count */
       if (fm.normals.size() != fm.positions.size()) {
         fm.normals.assign(fm.positions.size(), 0.0f);
@@ -336,8 +389,14 @@ void* finalize_scene(openskp::InstancedScene&& rawScene) {
       sc->meshes.push_back(std::move(fm));
       cnt += 1;
     }
-    resRanges.emplace(res.id, std::make_pair(startIdx, cnt));
+    resRanges.emplace(std::move(res.id), std::make_pair(startIdx, cnt));
+    std::vector<openskp::LocalPrimitive>().swap(res.primitives);
   }
+  std::vector<openskp::InstancedMeshResource>().swap(rawScene.mesh_resources);
+
+  /* Pre-reserve exact instance capacity so vector never doubles on massive models */
+  size_t estInsts = count_hierarchy_instances(rawScene.scene_hierarchy, resRanges, sc->meshes);
+  sc->instances.reserve(estInsts);
 
   /* Walk placed scene hierarchy */
   double identity[16] = {
@@ -347,11 +406,20 @@ void* finalize_scene(openskp::InstancedScene&& rawScene) {
       0, 0, 0, 1,
   };
   int32_t nextObjId = 1;
-  walk_hierarchy(*sc, sc->raw.scene_hierarchy, identity, resRanges, nextObjId);
+  walk_hierarchy(*sc, rawScene.layer_hidden, rawScene.scene_hierarchy, identity, resRanges, nextObjId);
+
+  /* Immediately free the heavy raw InstancedNode hierarchy tree! */
+  std::vector<openskp::InstancedNode>().swap(rawScene.scene_hierarchy.children);
+  sc->nameIndex.clear();
+  std::unordered_map<std::string, uint32_t>().swap(sc->nameIndex);
+  sc->layerMap.clear();
+  std::unordered_map<std::string, int32_t>().swap(sc->layerMap);
+  sc->namePool.shrink_to_fit();
+  sc->instances.shrink_to_fit();
 
   /* Compute overall bounds */
-  if (sc->raw.bounds.has_value()) {
-    const auto& b = *sc->raw.bounds;
+  if (rawScene.bounds.has_value()) {
+    const auto& b = *rawScene.bounds;
     sc->bounds.minX = static_cast<float>(b.min[0]);
     sc->bounds.minY = static_cast<float>(b.min[1]);
     sc->bounds.minZ = static_cast<float>(b.min[2]);
@@ -388,7 +456,7 @@ void* finalize_scene(openskp::InstancedScene&& rawScene) {
 
   /* Convert SketchUp Pages (Z-up inches -> glTF Y-up metres: (x, z, -y) * 0.0254) */
   constexpr double kInchToMetre = 0.0254;
-  for (const auto& p : sc->raw.pages) {
+  for (const auto& p : rawScene.pages) {
     FlattenedPage fp;
     fp.name = p.name;
     fp.fovDeg = static_cast<float>(p.fov);
@@ -448,9 +516,31 @@ void* vskp_load_file(const char* path) {
   }
   try {
     g_last_error.clear();
-    auto file = openskp::SkpFile::open(path);
-    auto scene = file.build_instanced_scene();
-    return finalize_scene(std::move(scene));
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+      set_error(std::string("Cannot open: ") + path);
+      return nullptr;
+    }
+    auto n = f.tellg();
+    if (n <= 0) {
+      set_error(std::string("Empty or unreadable file: ") + path);
+      return nullptr;
+    }
+    openskp::ByteBuffer buf(static_cast<size_t>(n));
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(buf.data()), n);
+    f.close();
+    openskp::ParseOptions opts;
+    opts.include_curve_sets = false;
+    void* res = nullptr;
+    {
+      auto scene = openskp::build_instanced_scene(std::move(buf), opts);
+      res = finalize_scene(std::move(scene));
+    }
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
+    return res;
   } catch (const std::exception& e) {
     set_error(e.what());
     return nullptr;
@@ -465,8 +555,17 @@ void* vskp_load_buffer(const uint8_t* data, int64_t size) {
   try {
     g_last_error.clear();
     openskp::ByteBuffer buf(data, data + size);
-    auto scene = openskp::build_instanced_scene(std::move(buf));
-    return finalize_scene(std::move(scene));
+    openskp::ParseOptions opts;
+    opts.include_curve_sets = false;
+    void* res = nullptr;
+    {
+      auto scene = openskp::build_instanced_scene(std::move(buf), opts);
+      res = finalize_scene(std::move(scene));
+    }
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
+    return res;
   } catch (const std::exception& e) {
     set_error(e.what());
     return nullptr;
@@ -475,6 +574,9 @@ void* vskp_load_buffer(const uint8_t* data, int64_t size) {
 
 void vskp_free(void* scene) {
   delete static_cast<VskpScene*>(scene);
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
 }
 
 const char* vskp_last_error(void) {
@@ -499,12 +601,12 @@ int32_t vskp_instance_count(void* scene) {
 
 int32_t vskp_material_count(void* scene) {
   if (!scene) return 0;
-  return static_cast<int32_t>(static_cast<VskpScene*>(scene)->raw.gltf_materials.size());
+  return static_cast<int32_t>(static_cast<VskpScene*>(scene)->materials.size());
 }
 
 int32_t vskp_texture_count(void* scene) {
   if (!scene) return 0;
-  return static_cast<int32_t>(static_cast<VskpScene*>(scene)->raw.textures.size());
+  return static_cast<int32_t>(static_cast<VskpScene*>(scene)->textures.size());
 }
 
 int32_t vskp_layer_count(void* scene) {
@@ -541,7 +643,7 @@ int32_t vskp_get_instance(void* scene, int32_t idx, VskpInstanceData* outInst) {
   auto* sc = static_cast<VskpScene*>(scene);
   if (idx < 0 || static_cast<size_t>(idx) >= sc->instances.size()) return 0;
   const FlattenedInstance& inst = sc->instances[idx];
-  outInst->name = inst.name.c_str();
+  outInst->name = (inst.nameIdx < sc->namePool.size()) ? sc->namePool[inst.nameIdx].c_str() : "";
   outInst->meshIndex = inst.meshIndex;
   outInst->materialIndex = inst.materialIndex;
   outInst->layerIndex = inst.layerIndex;
@@ -557,8 +659,8 @@ int32_t vskp_get_instance(void* scene, int32_t idx, VskpInstanceData* outInst) {
 int32_t vskp_get_material(void* scene, int32_t idx, VskpMaterialData* outMat) {
   if (!scene || !outMat) return 0;
   auto* sc = static_cast<VskpScene*>(scene);
-  if (idx < 0 || static_cast<size_t>(idx) >= sc->raw.gltf_materials.size()) return 0;
-  const auto& m = sc->raw.gltf_materials[idx];
+  if (idx < 0 || static_cast<size_t>(idx) >= sc->materials.size()) return 0;
+  const auto& m = sc->materials[idx];
   outMat->name = m.name.c_str();
   outMat->r = static_cast<float>(m.pbr_metallic_roughness.base_color_factor[0]);
   outMat->g = static_cast<float>(m.pbr_metallic_roughness.base_color_factor[1]);
@@ -576,8 +678,8 @@ int32_t vskp_get_material(void* scene, int32_t idx, VskpMaterialData* outMat) {
 int32_t vskp_get_texture(void* scene, int32_t idx, VskpTextureData* outTex) {
   if (!scene || !outTex) return 0;
   auto* sc = static_cast<VskpScene*>(scene);
-  if (idx < 0 || static_cast<size_t>(idx) >= sc->raw.textures.size()) return 0;
-  const auto& t = sc->raw.textures[idx];
+  if (idx < 0 || static_cast<size_t>(idx) >= sc->textures.size()) return 0;
+  const auto& t = sc->textures[idx];
   outTex->data = t.data.empty() ? nullptr : t.data.data();
   outTex->mimeType = t.mime_type.c_str();
   outTex->filename = t.filename.c_str();
